@@ -26,7 +26,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V8.9"
+APP_NAME = "Chart Pattern Scanner V9.0"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -956,53 +956,178 @@ def bear_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional
 def vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     """Volatility Contraction Pattern candidate.
 
-    Looks for a strong stock forming a base where volatility/range contracts in waves,
-    volume dries up, and price is close to a breakout pivot.
+    A true Volatility Contraction Pattern should show repeated, measurable pullback contractions:
+    larger pullback -> smaller pullback -> final tight pivot area.
+    This version intentionally avoids simple sideways boxes or general bases.
     """
-    if len(df) < 180:
+    if len(df) < 220:
         return None
     m = base_metrics(df, spy_df)
     mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
 
+    last = float(m["last"])
+    if last <= 0:
+        return None
+
+    # A Volatility Contraction Pattern is normally a continuation pattern in a leading/constructive stock,
+    # not a bottoming pattern far below major moving averages.
     if strict:
-        trend_ok = m["last"] > m["sma50"] > m["sma150"] > m["sma200"] and slope(df["SMA50"], 20) > 0 and m["last"] >= 0.82 * m["high252"]
+        trend_ok = (
+            last > m["sma50"] > m["sma150"] > m["sma200"]
+            and slope(df["SMA50"], 20) > 0
+            and last >= 0.82 * m["high252"]
+            and last >= 1.35 * m["low252"]
+        )
+    elif loose:
+        trend_ok = last > m["sma200"] and last >= 0.72 * m["high252"] and last >= 1.18 * m["low252"]
     else:
-        trend_ok = m["last"] > m["sma200"] and m["last"] >= (0.70 if loose else 0.78) * m["high252"] and m["last"] >= 1.20 * m["low252"]
+        trend_ok = (
+            last > m["sma50"]
+            and last > m["sma150"]
+            and last > m["sma200"]
+            and last >= 0.78 * m["high252"]
+            and last >= 1.25 * m["low252"]
+        )
     if not trend_ok:
         return None
 
-    # Measure progressive contraction in the base.
-    def rng(n: int) -> float:
-        w = df.tail(n)
-        return (float(w["High"].max()) - float(w["Low"].min())) / max(m["last"], 1e-9) * 100
-    r75, r45, r25, r12 = rng(75), rng(45), rng(25), rng(12)
-    seq_ok = r45 <= r75 * (0.82 if loose else 0.75) and r25 <= r45 * (0.82 if loose else 0.76) and r12 <= r25 * (0.92 if loose else 0.85)
-    final_tight = r12 <= max(8.5 if loose else 6.5, m.get("adr20", 3.0) * (2.4 if loose else 1.8))
-    if not (seq_ok and final_tight):
+    base = df.tail(110).copy()
+    work = base.iloc[:-1].copy() if len(base) > 20 else base.copy()
+    pivot = float(work["High"].tail(75).max())
+    base_low = float(work["Low"].tail(90).min())
+    base_depth = (pivot - base_low) / max(pivot, 1e-9) * 100
+
+    min_depth = 7.0 if loose else (10.0 if not strict else 12.0)
+    max_depth = 38.0 if loose else (30.0 if not strict else 26.0)
+    if not (min_depth <= base_depth <= max_depth):
         return None
 
-    pivot = float(df["High"].iloc[-35:-1].max())
-    if not (pivot * (0.94 if loose else 0.965) <= m["last"] <= pivot * (1.015 if loose else 1.006)):
+    # Prior advance into the base. Without this, a sideways utility/defensive box
+    # can look like a contraction mathematically but is not a classic Volatility Contraction Pattern.
+    prior = df.iloc[max(0, len(df)-220): max(0, len(df)-110)]
+    if prior.empty:
         return None
-    if r75 > (45 if loose else (35 if not strict else 30)):
+    prior_low = float(prior["Low"].min())
+    prior_advance = (pivot - prior_low) / max(prior_low, 1e-9) * 100
+    if prior_advance < (22.0 if loose else (30.0 if not strict else 40.0)):
         return None
 
+    # Must be close to the pivot. Volatility Contraction Pattern is most useful when the stock is tight under resistance.
+    dist_to_pivot = (pivot - last) / max(pivot, 1e-9) * 100
+    max_dist = 6.0 if loose else (4.0 if not strict else 2.5)
+    if dist_to_pivot < -1.0 or dist_to_pivot > max_dist:
+        return None
+
+    # Final tightness: this is the most important filter to avoid broad, choppy bases.
+    def range_pct(w: pd.DataFrame) -> float:
+        if w.empty:
+            return 999.0
+        hi = float(w["High"].max()); lo = float(w["Low"].min())
+        return (hi - lo) / max(hi, 1e-9) * 100
+
+    r20 = range_pct(df.tail(20))
+    r10 = range_pct(df.tail(10))
+    final_limit = max(5.5 if loose else (4.5 if not strict else 3.5), m.get("adr20", 3.0) * (1.35 if loose else 1.10))
+    if r10 > final_limit or r20 > (final_limit * 1.55):
+        return None
+
+    # Find local swing highs/lows and require actual pullback contractions,
+    # not just overlapping-window range shrink.
+    w = work.tail(100).reset_index(drop=True)
+    highs = w["High"].astype(float).to_numpy()
+    lows = w["Low"].astype(float).to_numpy()
+    k = 3
+    pts = []
+    for i in range(k, len(w) - k):
+        hseg = highs[i-k:i+k+1]
+        lseg = lows[i-k:i+k+1]
+        if highs[i] >= np.nanmax(hseg):
+            pts.append((i, "H", float(highs[i])))
+        if lows[i] <= np.nanmin(lseg):
+            pts.append((i, "L", float(lows[i])))
+    pts = sorted(pts, key=lambda x: (x[0], x[1]))
+
+    # Collapse consecutive same-type points and keep the most extreme one.
+    clean = []
+    for pt in pts:
+        if not clean or clean[-1][1] != pt[1]:
+            clean.append(pt)
+        else:
+            last_pt = clean[-1]
+            if pt[1] == "H" and pt[2] > last_pt[2]:
+                clean[-1] = pt
+            elif pt[1] == "L" and pt[2] < last_pt[2]:
+                clean[-1] = pt
+
+    pairs = []
+    for idx, pt in enumerate(clean[:-1]):
+        if pt[1] != "H":
+            continue
+        # next low after this high, before the next high
+        nxt_low = None
+        for nxt in clean[idx+1:]:
+            if nxt[1] == "H":
+                break
+            if nxt[1] == "L":
+                nxt_low = nxt
+                break
+        if nxt_low is None:
+            continue
+        depth = (pt[2] - nxt_low[2]) / max(pt[2], 1e-9) * 100
+        if depth >= (2.5 if loose else 3.0):
+            pairs.append((pt[0], nxt_low[0], depth, pt[2], nxt_low[2]))
+
+    # Need three material pullbacks that contract meaningfully.
+    good_seq = None
+    for i in range(0, max(0, len(pairs) - 2)):
+        d1, d2, d3 = pairs[i][2], pairs[i+1][2], pairs[i+2][2]
+        if d1 < (8.0 if loose else (10.0 if not strict else 12.0)):
+            continue
+        if d2 <= d1 * (0.88 if loose else 0.80) and d3 <= d2 * (0.88 if loose else 0.80):
+            if d3 <= (7.0 if loose else (5.8 if not strict else 4.8)):
+                # Last contraction should be recent enough to matter.
+                if pairs[i+2][1] >= len(w) - (32 if loose else 25):
+                    good_seq = (d1, d2, d3)
+                    break
+    if good_seq is None:
+        return None
+
+    # Lows should generally rise/hold; a flat lower boundary is more of a box or rectangle.
+    lows_seq = [p[4] for p in pairs[-3:]]
+    if len(lows_seq) >= 3:
+        higher_lows = lows_seq[1] >= lows_seq[0] * (0.985 if loose else 1.00) and lows_seq[2] >= lows_seq[1] * (0.985 if loose else 1.00)
+        if not higher_lows:
+            return None
+
+    # Volume should dry up near the pivot.
     vol10 = float(df["Volume"].tail(10).mean())
-    vol60 = float(df["Volume"].tail(60).mean())
-    vol_dry = vol10 < vol60 * (0.82 if loose else 0.70)
-    if strict and not vol_dry:
+    vol50 = float(df["Volume"].tail(50).mean())
+    vol_dry = vol10 < vol50 * (0.86 if loose else (0.78 if not strict else 0.70))
+    if not vol_dry:
         return None
 
-    score = 60
-    reasons = [f"volatility contraction {r75:.1f}% → {r45:.1f}% → {r25:.1f}% → {r12:.1f}%", "near pivot", "strong-stock base"]
-    if vol_dry: score += 15; reasons.append("volume dry-up")
-    if m.get("rs_vs_spy", 0) > 0: score += 10; reasons.append("outperforming SPY")
-    if m["last"] >= pivot * 0.985: score += 8; reasons.append("tight under pivot")
-    if m["sma50"] > m["sma150"] > m["sma200"]: score += 7; reasons.append("MA structure supportive")
-    stop = float(df["Low"].tail(25).min())
-    target = pivot + (float(df["High"].tail(75).max()) - float(df["Low"].tail(75).min())) * 0.65
-    return hit(ticker, "VCP", score, "Bullish", reasons, pivot, stop, target)
+    score = 62
+    d1, d2, d3 = good_seq
+    reasons = [
+        f"true contraction sequence {d1:.1f}% → {d2:.1f}% → {d3:.1f}%",
+        f"final tight range {r10:.1f}%",
+        "near pivot",
+        "volume dry-up",
+    ]
+    if m.get("rs_vs_spy", 0) > 0:
+        score += 10; reasons.append("outperforming SPY")
+    if last >= pivot * 0.985:
+        score += 8; reasons.append("tight under pivot")
+    if m["sma50"] > m["sma150"] > m["sma200"]:
+        score += 8; reasons.append("MA structure supportive")
+    if prior_advance >= 50:
+        score += 7; reasons.append(f"strong prior advance {prior_advance:.0f}%")
+    if base_depth <= 22:
+        score += 5; reasons.append(f"controlled base depth {base_depth:.0f}%")
 
+    stop = float(df["Low"].tail(25).min())
+    target = pivot + (pivot - stop) * 1.5
+    return hit(ticker, "Volatility Contraction Pattern", score, "Bullish", reasons, pivot, stop, target)
 
 def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     """Cup-with-handle approximation with U-shape and handle-position checks."""
@@ -2143,7 +2268,7 @@ def revenue_acceleration(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) 
 
 # Group scanners for one-pass watchlist generation. These modes help avoid running one pattern at a time.
 BULLISH_SETUP_NAMES = [
-    "Bull Flag", "VCP", "Cup & Handle", "Ascending Triangle", "Pocket Pivot",
+    "Bull Flag", "Volatility Contraction Pattern", "Cup & Handle", "Ascending Triangle", "Pocket Pivot",
     "Pivotal Point", "Minervini Trend Template", "Weinstein Stage 2",
     "Flat Base", "Pullback to 21 EMA", "200-Day Bounce", "MACD Bullish Cross",
     "Bollinger Squeeze", "Inside Day Breakout", "New 50-Day High", "RS New High",
@@ -2214,7 +2339,7 @@ SCANNERS: Dict[str, Callable] = {
     "All Technical Setups": all_technical_setups,
     "Bull Flag": bull_flag,
     "Bear Flag": bear_flag,
-    "VCP": vcp,
+    "Volatility Contraction Pattern": vcp,
     "Cup & Handle": cup_handle,
     "Ascending Triangle": ascending_triangle,
     "Pocket Pivot": pocket_pivot,
@@ -2434,7 +2559,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V8.9")
+    st.caption("Chart Pattern Scanner — V9.0")
 
     with st.sidebar:
         st.header("Scanner Settings")
