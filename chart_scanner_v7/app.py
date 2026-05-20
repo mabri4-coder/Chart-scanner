@@ -26,7 +26,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V9.2"
+APP_NAME = "Chart Pattern Scanner V9.4"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -487,6 +487,18 @@ def current_mode() -> str:
     return st.session_state.get("match_quality", "Balanced") if hasattr(st, "session_state") else "Balanced"
 
 
+def current_interval() -> str:
+    return st.session_state.get("scan_interval", "1d") if hasattr(st, "session_state") else "1d"
+
+
+def is_intraday() -> bool:
+    return current_interval() in {"1h", "30m", "15m", "5m"}
+
+
+def timeframe_mode_label() -> str:
+    return "Intraday" if is_intraday() else "Daily/Swing"
+
+
 def hit(ticker: str, scanner: str, score: float, direction: str, reasons: List[str], entry=None, stop=None, target=None) -> Optional[ScanHit]:
     score = clamp(score)
     if score < current_score_floor():
@@ -539,6 +551,301 @@ def _safe_mean(s: pd.Series, default: float = 0.0) -> float:
         return default
 
 
+
+
+def _recent_swing_points(df: pd.DataFrame, left: int = 2, right: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """Return simple swing highs and swing lows using bar index positions."""
+    highs: List[Tuple[int, float]] = []
+    lows: List[Tuple[int, float]] = []
+    if len(df) < left + right + 3:
+        return highs, lows
+    h = df["High"].astype(float).values
+    l = df["Low"].astype(float).values
+    for i in range(left, len(df) - right):
+        if h[i] >= np.nanmax(h[i-left:i+right+1]):
+            highs.append((i, float(h[i])))
+        if l[i] <= np.nanmin(l[i-left:i+right+1]):
+            lows.append((i, float(l[i])))
+    return highs, lows
+
+
+def _intraday_window(df: pd.DataFrame, bars: int = 120) -> pd.DataFrame:
+    return df.tail(min(bars, len(df))).copy().reset_index(drop=True)
+
+
+def intraday_bull_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    """Intraday bull flag: impulse up, controlled sideways/down pullback, entry at flag resistance."""
+    if len(df) < 60:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 110)
+    last = float(w["Close"].iloc[-1])
+    if last <= 0:
+        return None
+    # Find recent impulse high excluding the last 2 bars.
+    end = max(10, len(w)-2)
+    high_i = int(np.nanargmax(w["High"].iloc[max(0, end-55):end].values)) + max(0, end-55)
+    bars_since_high = len(w)-1-high_i
+    if bars_since_high < (4 if strict else 3) or bars_since_high > (32 if loose else 26):
+        return None
+    low_start = max(0, high_i-45)
+    pole_low_i = int(np.nanargmin(w["Low"].iloc[low_start:high_i+1].values)) + low_start
+    if high_i - pole_low_i < 4:
+        return None
+    pole_low = float(w["Low"].iloc[pole_low_i]); pole_high = float(w["High"].iloc[high_i])
+    pole_gain = pct(pole_high, pole_low)
+    min_gain = 1.8 if current_interval()=="5m" else 2.5
+    if pole_gain < (min_gain if loose else min_gain*1.25):
+        return None
+    flag = w.iloc[high_i+1:]
+    if len(flag) < 3:
+        return None
+    flag_low = float(flag["Low"].min())
+    pole_height = max(pole_high-pole_low, 1e-9)
+    pullback_of_pole = (pole_high-flag_low)/pole_height*100
+    if not ((12 if loose else 18) <= pullback_of_pole <= (75 if loose else 65 if not strict else 55)):
+        return None
+    high_slope = _slope_pct_per_bar(flag["High"])
+    close_slope = _slope_pct_per_bar(flag["Close"])
+    if high_slope > (0.20 if loose else 0.10) and close_slope > (0.14 if loose else 0.06):
+        return None
+    try:
+        x = np.arange(len(flag), dtype=float)
+        hi_m, hi_b = np.polyfit(x, flag["High"].astype(float).values, 1)
+        line_entry = float(hi_m*len(flag)+hi_b)
+    except Exception:
+        line_entry = float(flag["High"].tail(min(4, len(flag))).max())
+    recent_res = float(flag["High"].tail(min(5, len(flag))).max())
+    entry = max(line_entry, recent_res, last*1.001)
+    dist = (entry-last)/max(entry, 1e-9)*100
+    if dist > (4.5 if loose else 3.2 if not strict else 1.7) or last > entry*1.025:
+        return None
+    vol_ok = float(flag["Volume"].tail(min(5, len(flag))).mean()) <= float(w["Volume"].iloc[pole_low_i:high_i+1].mean()) * (1.05 if loose else 0.90)
+    if strict and not vol_ok:
+        return None
+    score = 58
+    reasons = ["intraday impulse + flag", f"pole gain {pole_gain:.1f}%", f"pullback {pullback_of_pole:.0f}% of pole", f"{dist:.1f}% from flag entry"]
+    if vol_ok: score += 10; reasons.append("flag volume quiet")
+    if dist <= 1.5: score += 10; reasons.append("near trigger")
+    if last >= float(flag["Close"].tail(min(5,len(flag))).mean()): score += 6; reasons.append("holding flag area")
+    stop = flag_low
+    target = entry + pole_height*0.75
+    return hit(ticker, "Bull Flag", score, "Bullish", reasons, entry, stop, target)
+
+
+def intraday_bear_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    """Intraday bear flag: sharp drop, weak bounce, entry at breakdown below flag support."""
+    if len(df) < 60:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 110)
+    last = float(w["Close"].iloc[-1])
+    end = max(10, len(w)-2)
+    low_i = int(np.nanargmin(w["Low"].iloc[max(0, end-55):end].values)) + max(0, end-55)
+    bars_since_low = len(w)-1-low_i
+    if bars_since_low < (4 if strict else 3) or bars_since_low > (32 if loose else 26):
+        return None
+    high_start = max(0, low_i-45)
+    pole_high_i = int(np.nanargmax(w["High"].iloc[high_start:low_i+1].values)) + high_start
+    if low_i - pole_high_i < 4:
+        return None
+    pole_high = float(w["High"].iloc[pole_high_i]); pole_low = float(w["Low"].iloc[low_i])
+    drop = pct(pole_low, pole_high)
+    if drop > -(1.8 if loose else 2.5):
+        return None
+    flag = w.iloc[low_i+1:]
+    if len(flag) < 3:
+        return None
+    bounce = (float(flag["High"].max())-pole_low)/max(pole_high-pole_low,1e-9)*100
+    if not ((8 if loose else 12) <= bounce <= (75 if loose else 60 if not strict else 52)):
+        return None
+    low_slope = _slope_pct_per_bar(flag["Low"])
+    close_slope = _slope_pct_per_bar(flag["Close"])
+    if low_slope < (-0.18 if loose else -0.08) and close_slope < (-0.10 if loose else -0.04):
+        return None
+    support = float(flag["Low"].tail(min(5, len(flag))).min())
+    entry = min(support, last*0.999)
+    dist = (last-entry)/max(last, 1e-9)*100
+    if dist > (4.5 if loose else 3.2 if not strict else 1.7):
+        return None
+    score = 58
+    reasons = ["intraday drop + bear flag", f"prior drop {abs(drop):.1f}%", f"bounce {bounce:.0f}% of drop", f"{dist:.1f}% above breakdown"]
+    if dist <= 1.5: score += 10; reasons.append("near trigger")
+    if last < m.get("ema21", last)*1.01: score += 6; reasons.append("under/near 21 EMA")
+    stop = float(flag["High"].max())
+    target = entry - (pole_high-pole_low)*0.75
+    return hit(ticker, "Bear Flag", score, "Bearish", reasons, entry, stop, target)
+
+
+def intraday_vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    """Intraday Volatility Contraction Pattern: successive smaller swing pullbacks under a pivot."""
+    if len(df) < 90:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 150)
+    last = float(w["Close"].iloc[-1])
+    if last <= 0:
+        return None
+    # prior advance before the tightening area
+    if pct(last, float(w["Close"].iloc[0])) < (2.0 if loose else 3.0):
+        return None
+    highs, lows = _recent_swing_points(w, 2, 2)
+    swings = sorted(highs + lows, key=lambda x: x[0])
+    if len(swings) < 7:
+        return None
+    # Use rolling range contractions over nested recent windows plus higher lows.
+    ranges = []
+    for bars in [90, 55, 34, 18]:
+        ww = w.tail(min(bars, len(w)))
+        ranges.append((float(ww["High"].max())-float(ww["Low"].min()))/max(last,1e-9)*100)
+    if not (ranges[0] > ranges[1] > ranges[2] > ranges[3]):
+        return None
+    if ranges[3] > (4.5 if loose else 3.5 if not strict else 2.5):
+        return None
+    recent_lows = [lo for i, lo in lows if i > len(w)-70]
+    if len(recent_lows) >= 3 and not (recent_lows[-1] >= min(recent_lows[-3:-1])*0.995):
+        return None
+    pivot = float(w["High"].tail(34).max())
+    dist = (pivot-last)/max(pivot, 1e-9)*100
+    if dist < -0.8 or dist > (4.0 if loose else 2.8 if not strict else 1.5):
+        return None
+    vol_dry = float(w["Volume"].tail(10).mean()) < float(w["Volume"].tail(60).mean()) * (0.90 if loose else 0.80)
+    if strict and not vol_dry:
+        return None
+    score = 60
+    reasons = [f"intraday volatility contraction {ranges[0]:.1f}% > {ranges[1]:.1f}% > {ranges[2]:.1f}% > {ranges[3]:.1f}%", "near pivot"]
+    if vol_dry: score += 12; reasons.append("volume dry-up")
+    if dist <= 1.5: score += 8; reasons.append("tight under pivot")
+    stop = float(w["Low"].tail(34).min())
+    target = pivot + (pivot-stop)*1.5
+    return hit(ticker, "Volatility Contraction Pattern", score, "Bullish", reasons, pivot, stop, target)
+
+
+def intraday_ascending_triangle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    """Intraday ascending triangle: flat resistance, separated touches, rising lows, compression."""
+    if len(df) < 70:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 120)
+    last = float(w["Close"].iloc[-1])
+    resistance = float(w["High"].tail(80).quantile(0.985))
+    tol = (0.008 if loose else 0.0055 if not strict else 0.0035)
+    touches_raw = [i for i, h in enumerate(w["High"].values) if abs(float(h)-resistance)/max(resistance,1e-9) <= tol]
+    touches = []
+    for i in touches_raw:
+        if not touches or i - touches[-1] >= (5 if loose else 7):
+            touches.append(i)
+    if len(touches) < (2 if loose else 3):
+        return None
+    _, lows = _recent_swing_points(w, 2, 2)
+    lows = [(i, lo) for i, lo in lows if i >= max(0, touches[0]-8) and lo < resistance*0.985]
+    if len(lows) < (2 if loose else 3):
+        return None
+    used = lows[-3:] if len(lows) >= 3 else lows[-2:]
+    if len(used) == 3:
+        rising = used[1][1] > used[0][1]*1.006 and used[2][1] > used[1][1]*1.002
+    else:
+        rising = used[1][1] > used[0][1]*1.012
+    if not rising:
+        return None
+    base_low = min(x[1] for x in used)
+    depth = (resistance-base_low)/max(resistance,1e-9)*100
+    if depth < (1.2 if loose else 1.8) or depth > (12 if loose else 9 if not strict else 7):
+        return None
+    if not (resistance*(1-(0.045 if loose else 0.03)) <= last <= resistance*(1+(0.006 if loose else 0.003))):
+        return None
+    early = (float(w["High"].tail(80).head(35).max())-float(w["Low"].tail(80).head(35).min()))/max(resistance,1e-9)
+    recent = (float(w["High"].tail(20).max())-float(w["Low"].tail(20).min()))/max(resistance,1e-9)
+    if recent > early*(0.88 if loose else 0.78):
+        return None
+    score = 60
+    reasons = ["intraday flat resistance", "rising lows", f"base depth {depth:.1f}%", "near breakout"]
+    if len(touches) >= 3: score += 8; reasons.append("3+ resistance touches")
+    if recent < early*0.65: score += 8; reasons.append("range compression")
+    stop = min(lo for _, lo in used[-2:])
+    target = resistance + (resistance-base_low)
+    return hit(ticker, "Ascending Triangle", score, "Bullish", reasons, resistance, stop, target)
+
+
+def intraday_falling_wedge(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if len(df) < 70:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 100)
+    last = float(w["Close"].iloc[-1])
+    high_slope = _slope_pct_per_bar(w["High"].rolling(4).max().dropna().tail(60))
+    low_slope = _slope_pct_per_bar(w["Low"].rolling(4).min().dropna().tail(60))
+    converging = high_slope < (-0.025 if loose else -0.04) and low_slope < 0 and high_slope < low_slope*1.15
+    early = (float(w["High"].head(35).max())-float(w["Low"].head(35).min()))/max(last,1e-9)
+    recent = (float(w["High"].tail(20).max())-float(w["Low"].tail(20).min()))/max(last,1e-9)
+    if not (converging and recent < early*(0.85 if loose else 0.72)):
+        return None
+    upper = float(w["High"].tail(15).max())
+    if last < upper*(0.97 if loose else 0.985):
+        return None
+    score = 58
+    reasons = ["intraday falling wedge", "converging trendlines", "range contraction", "near upper wedge line"]
+    if last > m.get("ema21", last)*0.995: score += 8; reasons.append("reclaiming/near 21 EMA")
+    return hit(ticker, "Falling Wedge", score, "Bullish Reversal", reasons, upper, float(w["Low"].min()), upper + 2*m.get("atr", 0))
+
+
+def intraday_double_bottom(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if len(df) < 65:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 110)
+    lows = _recent_swing_points(w, 2, 2)[1]
+    if len(lows) < 2:
+        return None
+    l1_i, l1 = lows[-2]; l2_i, l2 = lows[-1]
+    if l2_i-l1_i < (8 if loose else 12):
+        return None
+    similar = abs(l1-l2)/max((l1+l2)/2, 1e-9)*100 <= (2.5 if loose else 1.7 if not strict else 1.2)
+    if not similar or l2 < l1*(0.985 if loose else 0.995):
+        return None
+    neckline = float(w["High"].iloc[l1_i:l2_i+1].max())
+    last = float(w["Close"].iloc[-1])
+    dist = (neckline-last)/max(neckline,1e-9)*100
+    if dist < -1.5 or dist > (4.0 if loose else 2.5 if not strict else 1.3):
+        return None
+    score = 60
+    reasons = ["intraday double bottom", "two similar lows", "near neckline"]
+    if last > m.get("ema21", last)*0.995: score += 8; reasons.append("momentum stabilizing")
+    return hit(ticker, "Double Bottom", score, "Bullish Reversal", reasons, neckline, min(l1,l2), neckline+(neckline-min(l1,l2)))
+
+
+def intraday_tight_consolidation(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    """Intraday tight base / flat base: 8-30 bars of tight range after a move."""
+    if len(df) < 60:
+        return None
+    m = base_metrics(df, spy_df)
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    w = _intraday_window(df, 100)
+    last = float(w["Close"].iloc[-1])
+    base = w.tail(24 if not strict else 30)
+    prior = w.iloc[:-len(base)]
+    if len(prior) < 20:
+        return None
+    prior_move = pct(float(base["Close"].iloc[0]), float(prior["Close"].iloc[-20]))
+    if prior_move < (1.2 if loose else 2.0):
+        return None
+    hi = float(base["High"].max()); lo = float(base["Low"].min())
+    rng = (hi-lo)/max(last,1e-9)*100
+    if rng > (4.5 if loose else 3.2 if not strict else 2.2):
+        return None
+    if not (hi*0.96 <= last <= hi*1.01):
+        return None
+    vol_quiet = float(base["Volume"].tail(8).mean()) < float(w["Volume"].tail(60).mean())*(0.95 if loose else 0.85)
+    score = 58
+    reasons = ["intraday tight consolidation", f"base range {rng:.1f}%", "near pivot"]
+    if vol_quiet: score += 10; reasons.append("volume quiet")
+    return hit(ticker, "Flat Base", score, "Bullish Breakout", reasons, hi, lo, hi+(hi-lo))
 
 def bull_flag_core(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     """Bull flag candidate/triggered scan using the flag breakout line, not only the old high.
@@ -834,12 +1141,16 @@ def bull_flag_visual_candidate(ticker: str, df: pd.DataFrame, meta=None, spy_df=
 
 
 def bull_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_bull_flag(ticker, df, meta, spy_df)
     primary = bull_flag_core(ticker, df, meta, spy_df)
     if primary is not None:
         return primary
     return bull_flag_visual_candidate(ticker, df, meta, spy_df)
 
 def bear_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_bear_flag(ticker, df, meta, spy_df)
     """Balanced bear-flag logic with explicit bullish-leader rejection."""
     if len(df) < 80:
         return None
@@ -954,6 +1265,8 @@ def bear_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional
 
 
 def vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_vcp(ticker, df, meta, spy_df)
     """Volatility Contraction Pattern candidate.
 
     A true Volatility Contraction Pattern should show repeated, measurable pullback contractions:
@@ -1130,45 +1443,83 @@ def vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanH
     return hit(ticker, "Volatility Contraction Pattern", score, "Bullish", reasons, pivot, stop, target)
 
 def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
-    """Cup & Handle candidate with stricter structure checks.
+    """Cup & Handle scanner, adaptive for daily and intraday charts.
 
-    A real cup-with-handle should have:
-    1) a left rim, 2) a rounded decline into a cup low, 3) a right-side recovery back near
-    the left rim, and 4) a short, shallow handle in the upper half/upper third of the cup.
-    This avoids labeling normal uptrends, double tops, or broad sideways ranges as Cup & Handle.
+    The prior version was too focused on long daily bases. This version still rejects normal
+    rising channels, but it can also find shorter cup-and-handle structures on 1h/30m/15m charts.
+
+    Required structure:
+    - left rim
+    - rounded or U-shaped decline into cup low
+    - right-side recovery near the left rim
+    - short handle in the upper half of the cup
+    - price close to the handle pivot
     """
-    if len(df) < 220:
+    if len(df) < 90:
         return None
+
     m = base_metrics(df, spy_df)
-    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
+    mode = current_mode()
+    loose = mode == "Loose / candidate"
+    strict = mode == "Strict / confirmed"
 
-    # Use a longer window so the scanner can see a real cup rather than only the latest pullback.
-    w = df.tail(190).copy().reset_index(drop=True)
-    if len(w) < 150:
+    # Adaptive window: daily cups can need 150-190 bars, while intraday cups often need 60-120 bars.
+    available = len(df)
+    if available >= 220:
+        w_len = 190
+        intraday_style = False
+    elif available >= 140:
+        w_len = min(130, available)
+        intraday_style = True
+    else:
+        w_len = min(95, available)
+        intraday_style = True
+
+    w = df.tail(w_len).copy().reset_index(drop=True)
+    n = len(w)
+    if n < 80:
         return None
 
-    handle_max_len = 35 if loose else (30 if not strict else 25)
-    handle_min_len = 8 if loose else (10 if not strict else 12)
+    if intraday_style:
+        handle_min_len = 5 if loose else (6 if not strict else 8)
+        handle_max_len = 22 if loose else (18 if not strict else 15)
+        min_depth = 5.0 if loose else (6.5 if not strict else 8.0)
+        max_depth = 38.0 if loose else (32.0 if not strict else 26.0)
+        max_rim_mismatch = 18.0 if loose else (13.0 if not strict else 9.0)
+        max_dist_to_pivot = 8.0 if loose else (6.0 if not strict else 3.5)
+    else:
+        handle_min_len = 8 if loose else (10 if not strict else 12)
+        handle_max_len = 35 if loose else (30 if not strict else 25)
+        min_depth = 10.0 if loose else (12.0 if not strict else 14.0)
+        max_depth = 45.0 if loose else (36.0 if not strict else 30.0)
+        max_rim_mismatch = 14.0 if loose else (9.0 if not strict else 6.0)
+        max_dist_to_pivot = 8.0 if loose else (5.0 if not strict else 3.0)
 
-    # Do not let the handle itself define the cup low. Analyze the cup body first.
+    # Reserve the final area for the handle so the cup low is not chosen from the handle.
     body = w.iloc[:-handle_min_len].copy()
+    if len(body) < 60:
+        return None
+
     low_i = _position_of_min(body["Low"])
-    if low_i < 35 or low_i > len(body) - 45:
+    min_left_space = 16 if intraday_style else (35 if loose else 40)
+    min_right_space = 18 if intraday_style else (35 if loose else 45)
+    if low_i < min_left_space or low_i > len(body) - min_right_space:
         return None
 
     left = body.iloc[:low_i]
     right = body.iloc[low_i:]
-    if len(left) < 30 or len(right) < 35:
+    if len(left) < min_left_space or len(right) < min_right_space:
         return None
 
     left_rim_i = _position_of_max(left["High"])
     right_rim_rel_i = _position_of_max(right["High"])
     right_rim_i = low_i + right_rim_rel_i
 
-    # Rims must be reasonably separated from the cup low and from the final handle.
-    if low_i - left_rim_i < (18 if loose else 24):
+    # Rims must be separated from the low. This avoids calling a small pullback a cup.
+    min_side_bars = 8 if intraday_style else (18 if loose else 24)
+    if low_i - left_rim_i < min_side_bars:
         return None
-    if right_rim_i - low_i < (24 if loose else 30):
+    if right_rim_i - low_i < min_side_bars:
         return None
     if len(w) - right_rim_i < handle_min_len:
         return None
@@ -1181,35 +1532,32 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
         return None
 
     depth = (rim - cup_low) / rim * 100
-    min_depth = 10.0 if loose else (12.0 if not strict else 14.0)
-    max_depth = 45.0 if loose else (36.0 if not strict else 30.0)
     if not (min_depth <= depth <= max_depth):
         return None
 
-    # Left and right rims should be near each other. Too much mismatch is a broad base, not a clean cup.
     rim_mismatch = abs(right_rim - left_rim) / max(left_rim, 1e-9) * 100
-    if rim_mismatch > (14.0 if loose else (9.0 if not strict else 6.0)):
+    if rim_mismatch > max_rim_mismatch:
         return None
 
-    # The right side should actually recover most of the cup depth.
     recovery = (right_rim - cup_low) / max(rim - cup_low, 1e-9)
-    if recovery < (0.78 if loose else (0.86 if not strict else 0.92)):
+    if recovery < (0.72 if intraday_style and loose else (0.78 if intraday_style else (0.86 if not strict else 0.92))):
         return None
 
-    # Rounded bottom: reject one-day V bottoms. Require several bars near the lower third of the cup.
+    # Rounded/U shape check. For intraday cups we accept fewer bottom bars, but still reject one-bar V bottoms.
     lower_third_level = cup_low + (rim - cup_low) * 0.33
-    bottom_window = body.iloc[max(0, low_i - 18): min(len(body), low_i + 19)]
+    bw = 10 if intraday_style else 18
+    bottom_window = body.iloc[max(0, low_i - bw): min(len(body), low_i + bw + 1)]
     near_bottom_bars = int((bottom_window["Low"] <= lower_third_level).sum())
-    if near_bottom_bars < (4 if loose else (6 if not strict else 8)):
+    min_bottom_bars = 3 if intraday_style and loose else (4 if intraday_style else (6 if not strict else 8))
+    if near_bottom_bars < min_bottom_bars:
         return None
 
-    # Cup should not be a choppy rising channel. The left side should decline and the right side should recover.
+    # Reject rising channels / high bases mislabeled as cups: require real decline into the low and recovery after it.
     left_decline = (left_rim - cup_low) / max(left_rim, 1e-9) * 100
     right_recovery = (right_rim - cup_low) / max(cup_low, 1e-9) * 100
-    if left_decline < min_depth or right_recovery < min_depth * 0.75:
+    if left_decline < min_depth or right_recovery < min_depth * 0.55:
         return None
 
-    # Handle forms after the right rim. Use only the actual post-rim area, capped by max handle length.
     handle_start = right_rim_i + 1
     handle = w.iloc[handle_start:].copy()
     if len(handle) > handle_max_len:
@@ -1219,50 +1567,53 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
 
     handle_high = float(handle["High"].max())
     handle_low = float(handle["Low"].min())
-    pivot = max(float(handle["High"].iloc[:-1].max()) if len(handle) > 2 else handle_high, right_rim)
+    prior_handle_high = float(handle["High"].iloc[:-1].max()) if len(handle) > 2 else handle_high
+    pivot = max(prior_handle_high, right_rim)
     handle_depth = (handle_high - handle_low) / max(handle_high, 1e-9) * 100
 
-    max_handle_depth = min(15.0 if loose else (11.0 if not strict else 8.0), depth * (0.38 if loose else 0.30))
-    if not ((2.0 if loose else 3.0) <= handle_depth <= max_handle_depth):
+    max_handle_depth = min(16.0 if loose else (12.0 if not strict else 8.5), depth * (0.50 if intraday_style else (0.38 if loose else 0.30)))
+    if not ((1.5 if intraday_style else (2.0 if loose else 3.0)) <= handle_depth <= max_handle_depth):
         return None
 
-    # Handle should be in upper half / preferably upper third of cup.
-    upper_half_floor = cup_low + (rim - cup_low) * (0.55 if loose else 0.62)
+    upper_half_floor = cup_low + (rim - cup_low) * (0.50 if intraday_style and loose else (0.55 if loose else 0.62))
     if handle_low < upper_half_floor:
         return None
 
-    # Handle should drift sideways/down, not continue straight up.
+    # Handle should be sideways/down or only slightly rising. It should not be the right side of the cup continuing up.
     handle_slope = _slope_pct_per_bar(handle["Close"])
-    if handle_slope > (0.18 if loose else (0.08 if not strict else 0.02)):
+    if handle_slope > (0.22 if intraday_style and loose else (0.12 if intraday_style else (0.08 if not strict else 0.02))):
         return None
 
-    # Last price should be under/near the pivot, not far away and not already extended.
     last = float(m["last"])
     dist_to_pivot = (pivot - last) / max(pivot, 1e-9) * 100
-    if dist_to_pivot < -1.0 or dist_to_pivot > (8.0 if loose else (5.0 if not strict else 3.0)):
+    if dist_to_pivot < -1.5 or dist_to_pivot > max_dist_to_pivot:
         return None
 
-    # Trend and quality filters.
-    if not (last > m["sma200"] and last >= 0.75 * m["high252"]):
-        return None
-    if strict and not (last > m["sma50"] and m["sma50"] > m["sma150"]):
-        return None
+    # Trend/quality filters. Intraday cups do not need to be near a 52-week high; daily cups should be stronger.
+    if intraday_style:
+        if not (last > m["sma50"] or last > m["ema21"]):
+            return None
+    else:
+        if not (last > m["sma200"] and last >= 0.72 * m["high252"]):
+            return None
+        if strict and not (last > m["sma50"] and m["sma50"] > m["sma150"]):
+            return None
 
-    vol_quiet = float(handle["Volume"].tail(min(10, len(handle))).mean()) < float(w["Volume"].tail(90).mean()) * (0.88 if loose else (0.76 if not strict else 0.68))
+    vol_quiet = float(handle["Volume"].tail(min(8, len(handle))).mean()) < float(w["Volume"].tail(min(70, len(w))).mean()) * (0.92 if intraday_style else (0.88 if loose else (0.76 if not strict else 0.68)))
     if strict and not vol_quiet:
         return None
 
     score = 58
     reasons = [
-        f"cup depth {depth:.0f}%",
+        f"{'intraday ' if intraday_style else ''}cup depth {depth:.0f}%",
         f"rim mismatch {rim_mismatch:.1f}%",
         f"handle depth {handle_depth:.0f}%",
         "handle in upper half of cup",
         "near handle pivot",
     ]
-    if near_bottom_bars >= 8:
+    if near_bottom_bars >= (5 if intraday_style else 8):
         score += 8; reasons.append("rounded bottom")
-    if rim_mismatch <= 6:
+    if rim_mismatch <= (8 if intraday_style else 6):
         score += 8; reasons.append("right rim near left rim")
     if vol_quiet:
         score += 10; reasons.append("handle volume quiet")
@@ -1277,6 +1628,8 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
     return hit(ticker, "Cup & Handle", score, "Bullish", reasons, pivot, handle_low, target)
 
 def ascending_triangle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_ascending_triangle(ticker, df, meta, spy_df)
     """Ascending triangle: horizontal resistance plus clearly rising swing lows."""
     if len(df) < 120:
         return None
@@ -1728,6 +2081,8 @@ def bottom_finder(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Opti
 
 
 def falling_wedge(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_falling_wedge(ticker, df, meta, spy_df)
     """Falling wedge candidate: lower highs and lower lows with range contraction near upper trendline."""
     if len(df) < 120:
         return None
@@ -2276,6 +2631,8 @@ def change_in_character(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -
 
 
 def double_bottom(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_double_bottom(ticker, df, meta, spy_df)
     if len(df) < 130:
         return None
     m = base_metrics(df, spy_df); w = df.tail(90); thirds = np.array_split(w, 3)
@@ -2298,6 +2655,8 @@ def double_bottom(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Opti
 
 
 def flat_base(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
+    if is_intraday():
+        return intraday_tight_consolidation(ticker, df, meta, spy_df)
     if len(df) < 140:
         return None
     m = base_metrics(df, spy_df); w = df.tail(35)
@@ -2650,6 +3009,8 @@ def run_scan(
     fetch_fundamentals: bool,
     progress=True,
 ) -> pd.DataFrame:
+    if hasattr(st, "session_state"):
+        st.session_state["scan_interval"] = interval
     tickers = [_clean_ticker(t) for t in tickers]
     tickers = [t for t in tickers if t]
     spy = download_prices(("SPY",), period="1y", interval="1d").get("SPY")
@@ -2674,6 +3035,7 @@ def run_scan(
                 rows.append({
                     "Ticker": t,
                     "Scanner": result.scanner,
+                    "TimeframeMode": timeframe_mode_label(),
                     "Grade": result.grade,
                     "Score": round(result.score, 1),
                     "Direction": result.direction,
@@ -2740,7 +3102,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V9.2")
+    st.caption("Chart Pattern Scanner — V9.4")
 
     with st.sidebar:
         st.header("Scanner Settings")
@@ -2755,6 +3117,7 @@ def main():
         max_symbols = st.number_input("Max symbols to scan", min_value=10, max_value=6000, value=500, step=50)
         period = st.selectbox("History", ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"], index=4)
         interval = st.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m"], index=0)
+        st.session_state["scan_interval"] = interval
         if interval in {"5m", "15m", "30m"} and period not in {"5d", "1mo", "3mo"}:
             st.caption("Intraday data is automatically limited to 3mo or less for Yahoo/yfinance reliability.")
             period = "3mo"
