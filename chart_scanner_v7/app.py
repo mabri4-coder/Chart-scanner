@@ -26,7 +26,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V9.1"
+APP_NAME = "Chart Pattern Scanner V9.2"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -1277,47 +1277,138 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
     return hit(ticker, "Cup & Handle", score, "Bullish", reasons, pivot, handle_low, target)
 
 def ascending_triangle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
-    """Ascending triangle: flat resistance with rising/holding lows and price near breakout."""
-    if len(df) < 100:
+    """Ascending triangle: horizontal resistance plus clearly rising swing lows."""
+    if len(df) < 120:
         return None
+
     m = base_metrics(df, spy_df)
-    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
-    w = df.tail(70).copy()
-    resistance = float(w["High"].iloc[:-2].quantile(0.92))
-    max_hi = float(w["High"].iloc[:-2].max())
-    # resistance must be flat enough; not just a single spike.
-    band = 0.025 if loose else (0.018 if not strict else 0.012)
-    touches = w.iloc[:-2][abs(w.iloc[:-2]["High"] - resistance) / max(resistance, 1e-9) <= band]
-    if len(touches) < (2 if loose else 3):
-        return None
-    if max_hi > resistance * (1.04 if loose else 1.025):
+    mode = current_mode()
+    loose = mode == "Loose / candidate"
+    strict = mode == "Strict / confirmed"
+
+    # Use a medium window. Too short finds bull flags; too long finds broad rectangles.
+    lookback = 70 if not strict else 85
+    w = df.tail(lookback).copy()
+    if len(w) < 55:
         return None
 
-    lows = w["Low"].rolling(4).min().dropna()
-    if len(lows) < 20:
-        return None
-    low_first = float(lows.iloc[:len(lows)//2].quantile(0.25))
-    low_second = float(lows.iloc[len(lows)//2:].quantile(0.25))
-    rising_support = low_second >= low_first * (1.00 if loose else 1.02)
-    if strict:
-        rising_support = low_second >= low_first * 1.04
-    near = resistance * (0.94 if loose else 0.975) <= m["last"] <= resistance * (1.012 if loose else 1.004)
-    base_depth = (float(w["High"].max()) - float(w["Low"].min())) / max(m["last"], 1e-9) * 100
-    if not (rising_support and near and base_depth <= (32 if loose else 24)):
-        return None
-    if not (m["last"] > m["sma200"] and (m["last"] > m["sma50"] * 0.98 or slope(df["SMA50"], 20) >= 0)):
+    highs = w["High"].astype(float)
+    lows = w["Low"].astype(float)
+    closes = w["Close"].astype(float)
+    last = float(closes.iloc[-1])
+
+    # Basic trend context: ascending triangles are continuation/accumulation patterns,
+    # not damaged downtrends.
+    if not (last > m["sma200"] and (last > m["sma50"] * 0.97 or slope(df["SMA50"], 25) >= 0)):
         return None
 
-    vol_comp = float(df["Volume"].tail(10).mean()) < float(df["Volume"].tail(50).mean()) * (0.95 if loose else 0.85)
-    score = 60
-    reasons = ["multiple resistance touches", "support rising", "near breakout level"]
-    if vol_comp: score += 12; reasons.append("volume compression")
-    if m["last"] > m["sma50"]: score += 8; reasons.append("above 50-day MA")
-    if m.get("rs_vs_spy", 0) > 0: score += 10; reasons.append("RS positive")
+    # Resistance is the cluster of repeated highs, not a single spike.
+    high_ex_last = highs.iloc[:-2]
+    resistance = float(high_ex_last.quantile(0.95))
+    if not np.isfinite(resistance) or resistance <= 0:
+        return None
+
+    # Resistance must be flat and touched several times, with touches separated in time.
+    touch_band = 0.020 if loose else (0.014 if not strict else 0.010)
+    touch_idx = [i for i, h in enumerate(highs.iloc[:-2]) if abs(float(h) - resistance) / resistance <= touch_band]
+
+    # Compress adjacent bars into separate touches so one multi-day spike does not count as 3 touches.
+    separated = []
+    min_sep = 5 if loose else (7 if not strict else 9)
+    for i in touch_idx:
+        if not separated or i - separated[-1] >= min_sep:
+            separated.append(i)
+        else:
+            # keep the bar with the closer high inside the same touch cluster
+            if abs(float(highs.iloc[i]) - resistance) < abs(float(highs.iloc[separated[-1]]) - resistance):
+                separated[-1] = i
+
+    min_touches = 2 if loose else 3
+    if len(separated) < min_touches:
+        return None
+    if separated[-1] - separated[0] < (18 if loose else 25):
+        return None
+
+    # Reject if the resistance area is actually a rising channel/new-high sequence.
+    touch_prices = [float(highs.iloc[i]) for i in separated]
+    if max(touch_prices) / max(min(touch_prices), 1e-9) - 1 > (0.045 if loose else 0.030 if not strict else 0.022):
+        return None
+    if float(highs.max()) > resistance * (1.035 if loose else 1.020 if not strict else 1.014):
+        return None
+
+    # Find real swing lows. Need rising lows; equal/flat lows are rectangle, not ascending triangle.
+    swing_lows = []
+    for i in range(3, len(w) - 3):
+        lo = float(lows.iloc[i])
+        if lo <= float(lows.iloc[i-3:i].min()) and lo <= float(lows.iloc[i+1:i+4].min()):
+            swing_lows.append((i, lo))
+
+    # Keep lows that occur after/around the first resistance touch. Earlier lows often belong to the prior trend.
+    swing_lows = [(i, lo) for i, lo in swing_lows if i >= max(0, separated[0] - 6) and lo < resistance * 0.98]
+    if len(swing_lows) < (2 if loose else 3):
+        return None
+
+    # Use the last 3 swing lows. They should be rising and reasonably spaced.
+    lows_used = swing_lows[-3:] if len(swing_lows) >= 3 else swing_lows[-2:]
+    if len(lows_used) >= 3:
+        l1, l2, l3 = [x[1] for x in lows_used]
+        rising_lows = (l2 >= l1 * (1.015 if loose else 1.025)) and (l3 >= l2 * (1.005 if loose else 1.015))
+    else:
+        l1, l2 = [x[1] for x in lows_used]
+        rising_lows = l2 >= l1 * (1.035 if loose else 1.055)
+    if strict and len(lows_used) < 3:
+        return None
+    if not rising_lows:
+        return None
+
+    # Base must be a triangle-sized consolidation, not a huge broad range and not a tiny micro pause.
+    base_low = min(lo for _, lo in lows_used)
+    base_depth = (resistance - base_low) / max(resistance, 1e-9) * 100
+    if base_depth < (5 if loose else 7) or base_depth > (28 if loose else 22 if not strict else 18):
+        return None
+
+    # Price should be near but not already far above the breakout area.
+    max_below = 0.085 if loose else (0.065 if not strict else 0.045)
+    max_above = 0.012 if loose else (0.006 if not strict else 0.002)
+    if not (resistance * (1 - max_below) <= last <= resistance * (1 + max_above)):
+        return None
+
+    # Require compression: recent range should be tighter than early/middle range.
+    early_range = (float(highs.iloc[:25].max()) - float(lows.iloc[:25].min())) / max(resistance, 1e-9)
+    recent_range = (float(highs.iloc[-18:].max()) - float(lows.iloc[-18:].min())) / max(resistance, 1e-9)
+    if recent_range > early_range * (0.82 if loose else 0.70 if not strict else 0.62):
+        return None
+
+    # Reject one-bar breakout/flag structures: if the last resistance touch is too recent and there is no long base,
+    # it is usually a bull flag or high-tight base, not an ascending triangle.
+    if separated[-1] > len(w) - 7 and separated[-1] - separated[0] < 32:
+        return None
+
+    vol_comp = float(df["Volume"].tail(10).mean()) < float(df["Volume"].tail(50).mean()) * (0.95 if loose else 0.85 if not strict else 0.75)
     if strict and not vol_comp:
         return None
-    stop = float(w["Low"].tail(25).min())
-    return hit(ticker, "Ascending Triangle", score, "Bullish", reasons, resistance, stop, resistance + (resistance - float(w["Low"].min())))
+
+    score = 62
+    reasons = [
+        "flat resistance with separated touches",
+        "rising swing lows",
+        "price near breakout area",
+        f"base depth {base_depth:.0f}%",
+    ]
+    if len(separated) >= 3:
+        score += 8; reasons.append("3+ resistance touches")
+    if len(lows_used) >= 3:
+        score += 8; reasons.append("3 rising lows")
+    if vol_comp:
+        score += 10; reasons.append("volume compression")
+    if m["last"] > m["sma50"]:
+        score += 6; reasons.append("above 50-day MA")
+    if m.get("rs_vs_spy", 0) > 0:
+        score += 8; reasons.append("RS positive")
+
+    stop = min(lo for _, lo in lows_used[-2:])
+    target = resistance + (resistance - base_low)
+    return hit(ticker, "Ascending Triangle", score, "Bullish", reasons, resistance, stop, target)
 
 def pocket_pivot(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     if len(df) < 70:
@@ -2649,7 +2740,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V9.1")
+    st.caption("Chart Pattern Scanner — V9.2")
 
     with st.sidebar:
         st.header("Scanner Settings")
