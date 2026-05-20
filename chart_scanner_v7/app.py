@@ -1,5 +1,5 @@
 """
-Chart Scanner
+Chart Pattern Scanner
 Original implementation for educational / research use.
 
 Run:
@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner"
+APP_NAME = "Chart Pattern Scanner V7"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -2231,8 +2231,8 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
-    st.title("📈 Market Pattern Scanner")
-    st.caption("Chart Scanner — V7: tighter pattern logic, stale-result protection, setup status, distance-to-entry, risk/reward, and duplicate-share filtering.")
+    st.title("📈 Chart Pattern Scanner")
+    st.caption("Chart Pattern Scanner — V7: tighter pattern logic, stale-result protection, setup status, distance-to-entry, risk/reward, and duplicate-share filtering.")
 
     with st.sidebar:
         st.header("Scanner Settings")
