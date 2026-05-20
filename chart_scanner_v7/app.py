@@ -2286,6 +2286,7 @@ def main():
         period, interval, float(min_price), int(min_avg_vol), bool(fetch_fa), tuple(tickers[: int(max_symbols)])
     )
 
+    st.info("For true professional real-time scanning of 5,000+ symbols every few minutes, connect these rules to a licensed feed such as Polygon, Alpaca, Tradier, or Interactive Brokers. Yahoo/yfinance is adequate for prototyping but can be delayed or rate-limited. V7 uses tighter pattern definitions, prevents stale results, and adds Setup Status / Distance-to-Entry so you can separate Watchlist names from near-trigger trade candidates. Use Balanced for trading candidates and Strict for textbook patterns; always confirm the chart before entry.")
 
     if run:
         start = time.time()
