@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V8.6"
+APP_NAME = "Chart Pattern Scanner V7"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -532,77 +532,60 @@ def _safe_mean(s: pd.Series, default: float = 0.0) -> float:
 
 
 def bull_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
-    """Bull flag candidate/triggered scan using the flag breakout line, not only the old high.
+    """Confirmed/candidate bull flag.
 
-    Visual bull flags often break the descending flag resistance before they reclaim the
-    original pole high. Earlier versions used the old pole high as the main pivot, which
-    could miss valid setups such as a strong stock pulling back in a controlled channel.
+    A bull flag must have: prior impulse/pole, then a controlled pullback or sideways/down flag,
+    price near the pivot, and preferably volume contraction. This avoids calling every strong
+    stock in an uptrend a bull flag.
     """
-    if len(df) < 80:
+    if len(df) < 90:
         return None
-
     m = base_metrics(df, spy_df)
     if any(np.isnan(x) for x in [m["last"], m["sma50"], m["sma200"], m["ema21"], m["atr"]]):
         return None
+    mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
 
-    mode = current_mode()
-    loose = mode == "Loose / candidate"
-    strict = mode == "Strict / confirmed"
-    close = m["last"]
-
-    # Bull flag is a continuation setup. Keep a bullish context, but allow a stock
-    # that is pulling back toward the 50-day after a strong impulse.
+    # Continuation context: bullish, but not wildly extended.
     if strict:
-        trend_ok = close > m["sma50"] * 0.99 and m["sma50"] > m["sma150"] > m["sma200"] and slope(df["SMA50"], 20) > 0
+        trend_ok = m["last"] > m["sma50"] > m["sma150"] > m["sma200"] and slope(df["SMA50"], 20) > 0
     else:
-        trend_ok = (
-            close > m["sma200"] * (0.97 if loose else 0.985) and
-            m["sma50"] >= m["sma200"] * (0.96 if loose else 0.98) and
-            slope(df["SMA50"], 20) > (-0.03 if loose else -0.01)
-        )
+        trend_ok = m["last"] > m["sma200"] * (0.99 if not loose else 0.97) and m["sma50"] >= m["sma200"] * (0.98 if not loose else 0.96)
     if not trend_ok:
         return None
 
-    lookback = 60 if loose else 55
+    lookback = 42 if loose else 35
     exclude_recent = 1 if loose else 2
     start = max(0, len(df) - lookback)
     end = max(start + 1, len(df) - exclude_recent)
     pivot_slice = df.iloc[start:end]
-    if pivot_slice.empty:
-        return None
-
     pivot_pos = start + _position_of_max(pivot_slice["High"])
     bars_since_pivot = len(df) - 1 - pivot_pos
-
     min_bars = 3 if loose else (4 if not strict else 5)
-    max_bars = 34 if loose else (30 if not strict else 22)
+    max_bars = 24 if loose else (18 if not strict else 14)
     if bars_since_pivot < min_bars or bars_since_pivot > max_bars:
         return None
 
     pivot_high = float(df["High"].iloc[pivot_pos])
-
-    # Find the impulse/pole low before the pivot high.
-    pole_window = df.iloc[max(0, pivot_pos - 60): pivot_pos + 1]
+    pole_window = df.iloc[max(0, pivot_pos - 45): pivot_pos + 1]
     if len(pole_window) < 8:
         return None
     pole_low_pos = pole_window["Low"].idxmin()
     pole_low_i = df.index.get_loc(pole_low_pos)
     pole_low = float(df.loc[pole_low_pos, "Low"])
     pole_bars = pivot_pos - pole_low_i
-    if pole_bars < 5 or pole_bars > 55:
+    if pole_bars < 5 or pole_bars > 40:
         return None
-
     pole_gain = pct(pivot_high, pole_low)
-    min_gain = max(6 if loose else (8 if not strict else 11), m.get("adr20", 3.0) * (1.8 if loose else 2.2))
+    min_gain = max(7 if loose else 10, m.get("adr20", 3.0) * (2.2 if loose else 2.8))
     if pole_gain < min_gain:
         return None
 
     flag = df.iloc[pivot_pos + 1:]
     if len(flag) < min_bars:
         return None
-
     flag_high = float(flag["High"].max())
     flag_low = float(flag["Low"].min())
+    close = m["last"]
     pole_height = max(pivot_high - pole_low, 1e-9)
     depth_of_pole = (pivot_high - flag_low) / pole_height * 100
     depth_pct_price = (pivot_high - flag_low) / max(pivot_high, 1e-9) * 100
@@ -611,97 +594,48 @@ def bull_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional
     low_slope = _slope_pct_per_bar(flag["Low"])
     close_slope = _slope_pct_per_bar(flag["Close"])
 
-    # Accept a controlled flag/retrace. Balanced allows deeper mega-cap style flags,
-    # while Strict keeps textbook patterns tighter.
-    max_depth = 72 if loose else (64 if not strict else 48)
-    min_depth = 1.5 if loose else 3.0
-    if not (min_depth <= depth_of_pole <= max_depth):
+    max_depth = 58 if loose else (45 if not strict else 38)
+    if not ((2 if loose else 4) <= depth_of_pole <= max_depth):
         return None
-    if depth_pct_price > max(17 if loose else (14 if not strict else 10), m.get("adr20", 3.0) * (4.8 if loose else 3.8)):
+    if depth_pct_price > max(14 if loose else 11, m.get("adr20", 3.0) * (4.0 if loose else 3.2)):
         return None
-    if flag_range_pct > max(15 if loose else (12 if not strict else 8), m.get("adr20", 3.0) * (4.2 if loose else 3.2)):
+    if flag_range_pct > max(11 if loose else 8, m.get("adr20", 3.0) * (3.4 if loose else 2.6)):
         return None
 
-    # The flag should be sideways/down or slightly drifting, not a new sharp rally.
-    recent_highs_declining = False
-    if len(flag) >= 8:
-        first_half_hi = float(flag["High"].iloc[: max(3, len(flag)//2)].max())
-        second_half_hi = float(flag["High"].iloc[max(3, len(flag)//2):].max())
-        recent_highs_declining = second_half_hi <= first_half_hi * 1.01
-
-    channel_ok = (
-        high_slope <= (0.28 if loose else 0.18) or
-        close_slope <= (0.12 if loose else 0.06) or
-        recent_highs_declining
-    )
+    # A bull flag should not be an upward channel already chasing away from pivot.
+    if high_slope > (0.30 if loose else 0.18) and close <= pivot_high * 1.005:
+        return None
+    if strict and close_slope > 0.15:
+        return None
+    # Permit sideways/downward flags; do not require perfect lower lows.
+    channel_ok = high_slope <= (0.25 if loose else 0.12) or close_slope <= 0.05
     if not channel_ok:
         return None
-    if strict and close_slope > 0.18:
+
+    near_low = 0.92 if loose else (0.95 if not strict else 0.97)
+    near_high = 1.025 if loose else (1.015 if not strict else 1.008)
+    if not (pivot_high * near_low <= close <= pivot_high * near_high):
         return None
 
-    # Use the actual flag breakout area as entry. This is usually the recent descending
-    # flag resistance, not necessarily the old pole high.
-    try:
-        x = np.arange(len(flag), dtype=float)
-        high_vals = flag["High"].astype(float).values
-        hi_m, hi_b = np.polyfit(x, high_vals, 1)
-        projected_resistance = float(hi_m * (len(flag)) + hi_b)
-    except Exception:
-        projected_resistance = float(flag["High"].tail(min(8, len(flag))).max())
-
-    recent_resistance = float(flag["High"].tail(min(8, len(flag))).max())
-    flag_breakout = max(projected_resistance, recent_resistance)
-    # Do not let an odd projected line put entry above the old pole high or below support.
-    entry = min(pivot_high, max(flag_breakout, close * 1.002))
-
-    # Candidate must be reasonably close to the flag breakout line. This is the key
-    # AMZN-style fix: do not require price to be close to the old high.
-    dist_to_entry = (entry - close) / max(entry, 1e-9) * 100
-    max_dist = 9.0 if loose else (7.0 if not strict else 3.0)
-    if dist_to_entry > max_dist:
-        return None
-    if close > entry * (1.08 if loose else 1.05):
-        return None
-
-    # Volume contraction helps separate real flags from noisy pullbacks.
     pole_vol = _safe_mean(df["Volume"].iloc[max(0, pole_low_i): pivot_pos + 1])
     flag_vol = _safe_mean(flag["Volume"])
-    recent_flag_vol = _safe_mean(flag["Volume"].tail(min(8, len(flag))))
-    vol_contract = flag_vol < pole_vol * (0.98 if loose else 0.90) or recent_flag_vol < pole_vol * (0.85 if loose else 0.78)
+    vol_contract = flag_vol < pole_vol * (0.95 if loose else 0.85)
     if strict and not vol_contract:
         return None
 
-    score = 58
-    triggered = close >= entry
-    state_word = "flag breakout triggered" if triggered else "bull flag candidate"
-    reasons = [
-        f"{state_word}: flag resistance near {entry:.2f}",
-        f"pole gain {pole_gain:.1f}%",
-        f"pullback {depth_of_pole:.0f}% of pole",
-        f"{dist_to_entry:.1f}% from entry"
-    ]
-    if vol_contract:
-        score += 12
-        reasons.append("flag volume contracted")
-    if high_slope <= 0.10 or recent_highs_declining:
-        score += 10
-        reasons.append("sideways/down flag")
-    if dist_to_entry <= 2.0:
-        score += 8
-        reasons.append("near trigger")
-    if close > m["ema21"] * 0.995:
-        score += 5
-        reasons.append("holding/reclaiming 21 EMA")
-    if m.get("rs_vs_spy", 0) > -2:
-        score += 5
-        reasons.append("relative strength acceptable")
-    if triggered and m["rvol"] > 1.15:
-        score += 8
-        reasons.append("breakout volume confirmation")
+    score = 60
+    state_word = "breakout triggered pole+flag" if close >= pivot_high else "pole+flag candidate"
+    reasons = [f"{state_word}: pivot {bars_since_pivot} bars ago", f"pole gain {pole_gain:.1f}%", f"pullback {depth_of_pole:.0f}% of pole"]
+    if vol_contract: score += 12; reasons.append("flag volume contracted")
+    if high_slope <= 0 and close_slope <= 0.10: score += 10; reasons.append("sideways/down flag")
+    if close >= pivot_high * 0.985: score += 8; reasons.append("tight under pivot")
+    if close > m["ema21"]: score += 5; reasons.append("holding 21 EMA")
+    if m.get("rs_vs_spy", 0) > 0: score += 5; reasons.append("outperforming SPY")
 
+    entry = round(pivot_high, 2)
     stop = round(flag_low, 2)
-    target = round(entry + pole_height * 0.75, 2)
-    return hit(ticker, "Bull Flag", score, "Bullish", reasons, round(entry, 2), stop, target)
+    target = round(entry + pole_height, 2)
+    return hit(ticker, "Bull Flag", score, "Bullish", reasons, entry, stop, target)
 
 def bear_flag(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     """Balanced bear-flag logic with explicit bullish-leader rejection."""
@@ -2298,7 +2232,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V8.6")
+    st.caption("Chart Pattern Scanner — V7: tighter pattern logic, stale-result protection, setup status, distance-to-entry, risk/reward, and duplicate-share filtering.")
 
     with st.sidebar:
         st.header("Scanner Settings")
@@ -2332,11 +2266,6 @@ def main():
     else:
         tickers = load_nasdaq_trader_symbols(include_etfs=include_etfs)["Ticker"].tolist()
 
-    # Always include the custom/priority tickers first, even when scanning S&P 500 or Full U.S.
-    # This lets you test names such as AMZN directly without changing Universe to Custom.
-    priority_tickers = parse_tickers(custom)
-    tickers = list(dict.fromkeys(priority_tickers + tickers))
-
     if hide_duplicate_share_classes:
         tickers = [t for t in tickers if t not in DUPLICATE_SHARE_CLASS_REMOVE]
     tickers = tickers[: int(max_symbols)]
@@ -2356,6 +2285,8 @@ def main():
         scanner_name, match_quality, universe, include_etfs, hide_duplicate_share_classes, custom.strip(), int(max_symbols),
         period, interval, float(min_price), int(min_avg_vol), bool(fetch_fa), tuple(tickers[: int(max_symbols)])
     )
+
+    st.info("For true professional real-time scanning of 5,000+ symbols every few minutes, connect these rules to a licensed feed such as Polygon, Alpaca, Tradier, or Interactive Brokers. Yahoo/yfinance is adequate for prototyping but can be delayed or rate-limited. V7 uses tighter pattern definitions, prevents stale results, and adds Setup Status / Distance-to-Entry so you can separate Watchlist names from near-trigger trade candidates. Use Balanced for trading candidates and Strict for textbook patterns; always confirm the chart before entry.")
 
     if run:
         start = time.time()
@@ -2383,11 +2314,6 @@ def main():
         st.caption(f"Showing results from: {st.session_state.get('last_scanner_name', scanner_name)} | Match: {st.session_state.get('last_match_quality', match_quality)}")
         cols = ["Scanner","Ticker","SetupStatus","DistToEntry%","RR","Grade","Score","Direction","Last","%Chg","RVOL","AvgVol50","ADR20%","TA","FA","ARS","Entry","Stop","Target","Sector","Reasons"]
         show = results[[c for c in cols if c in results.columns]].copy()
-        ticker_filter = st.text_input("Filter results by ticker", value="", help="Example: AMZN")
-        if ticker_filter.strip():
-            keepers = parse_tickers(ticker_filter)
-            if keepers and "Ticker" in show.columns:
-                show = show[show["Ticker"].isin(keepers)]
         st.dataframe(show, use_container_width=True, height=430)
 
         csv = results.to_csv(index=False).encode("utf-8")
