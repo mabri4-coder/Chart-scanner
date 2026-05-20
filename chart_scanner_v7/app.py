@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Market Pattern Scanner V7"
+APP_NAME = "Chart Pattern Scanner"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
