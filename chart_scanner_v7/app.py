@@ -26,7 +26,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V9.0"
+APP_NAME = "Chart Pattern Scanner V9.1"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -1130,61 +1130,151 @@ def vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanH
     return hit(ticker, "Volatility Contraction Pattern", score, "Bullish", reasons, pivot, stop, target)
 
 def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
-    """Cup-with-handle approximation with U-shape and handle-position checks."""
-    if len(df) < 180:
+    """Cup & Handle candidate with stricter structure checks.
+
+    A real cup-with-handle should have:
+    1) a left rim, 2) a rounded decline into a cup low, 3) a right-side recovery back near
+    the left rim, and 4) a short, shallow handle in the upper half/upper third of the cup.
+    This avoids labeling normal uptrends, double tops, or broad sideways ranges as Cup & Handle.
+    """
+    if len(df) < 220:
         return None
     m = base_metrics(df, spy_df)
     mode = current_mode(); loose = mode == "Loose / candidate"; strict = mode == "Strict / confirmed"
-    w = df.tail(160).copy()
-    low_i = _position_of_min(w["Low"])
-    if low_i < 35 or low_i > 115:
+
+    # Use a longer window so the scanner can see a real cup rather than only the latest pullback.
+    w = df.tail(190).copy().reset_index(drop=True)
+    if len(w) < 150:
         return None
-    left = w.iloc[:low_i]
-    right = w.iloc[low_i:]
-    handle = w.tail(25 if not strict else 20)
-    if len(left) < 25 or len(right) < 35:
+
+    handle_max_len = 35 if loose else (30 if not strict else 25)
+    handle_min_len = 8 if loose else (10 if not strict else 12)
+
+    # Do not let the handle itself define the cup low. Analyze the cup body first.
+    body = w.iloc[:-handle_min_len].copy()
+    low_i = _position_of_min(body["Low"])
+    if low_i < 35 or low_i > len(body) - 45:
         return None
-    left_high = float(left["High"].max())
+
+    left = body.iloc[:low_i]
+    right = body.iloc[low_i:]
+    if len(left) < 30 or len(right) < 35:
+        return None
+
+    left_rim_i = _position_of_max(left["High"])
+    right_rim_rel_i = _position_of_max(right["High"])
+    right_rim_i = low_i + right_rim_rel_i
+
+    # Rims must be reasonably separated from the cup low and from the final handle.
+    if low_i - left_rim_i < (18 if loose else 24):
+        return None
+    if right_rim_i - low_i < (24 if loose else 30):
+        return None
+    if len(w) - right_rim_i < handle_min_len:
+        return None
+
+    left_rim = float(w["High"].iloc[left_rim_i])
+    right_rim = float(w["High"].iloc[right_rim_i])
     cup_low = float(w["Low"].iloc[low_i])
-    right_high = float(right["High"].max())
-    handle_low = float(handle["Low"].min())
+    rim = min(left_rim, right_rim)
+    if rim <= 0 or cup_low <= 0:
+        return None
+
+    depth = (rim - cup_low) / rim * 100
+    min_depth = 10.0 if loose else (12.0 if not strict else 14.0)
+    max_depth = 45.0 if loose else (36.0 if not strict else 30.0)
+    if not (min_depth <= depth <= max_depth):
+        return None
+
+    # Left and right rims should be near each other. Too much mismatch is a broad base, not a clean cup.
+    rim_mismatch = abs(right_rim - left_rim) / max(left_rim, 1e-9) * 100
+    if rim_mismatch > (14.0 if loose else (9.0 if not strict else 6.0)):
+        return None
+
+    # The right side should actually recover most of the cup depth.
+    recovery = (right_rim - cup_low) / max(rim - cup_low, 1e-9)
+    if recovery < (0.78 if loose else (0.86 if not strict else 0.92)):
+        return None
+
+    # Rounded bottom: reject one-day V bottoms. Require several bars near the lower third of the cup.
+    lower_third_level = cup_low + (rim - cup_low) * 0.33
+    bottom_window = body.iloc[max(0, low_i - 18): min(len(body), low_i + 19)]
+    near_bottom_bars = int((bottom_window["Low"] <= lower_third_level).sum())
+    if near_bottom_bars < (4 if loose else (6 if not strict else 8)):
+        return None
+
+    # Cup should not be a choppy rising channel. The left side should decline and the right side should recover.
+    left_decline = (left_rim - cup_low) / max(left_rim, 1e-9) * 100
+    right_recovery = (right_rim - cup_low) / max(cup_low, 1e-9) * 100
+    if left_decline < min_depth or right_recovery < min_depth * 0.75:
+        return None
+
+    # Handle forms after the right rim. Use only the actual post-rim area, capped by max handle length.
+    handle_start = right_rim_i + 1
+    handle = w.iloc[handle_start:].copy()
+    if len(handle) > handle_max_len:
+        handle = handle.tail(handle_max_len)
+    if len(handle) < handle_min_len:
+        return None
+
     handle_high = float(handle["High"].max())
-    depth = (left_high - cup_low) / max(left_high, 1e-9) * 100
-    right_near_left = abs(right_high - left_high) / max(left_high, 1e-9) * 100
+    handle_low = float(handle["Low"].min())
+    pivot = max(float(handle["High"].iloc[:-1].max()) if len(handle) > 2 else handle_high, right_rim)
     handle_depth = (handle_high - handle_low) / max(handle_high, 1e-9) * 100
-    pivot = handle_high
 
-    if not ((10 if loose else 12) <= depth <= (50 if loose else 40)):
-        return None
-    if right_near_left > (16 if loose else (10 if not strict else 7)):
-        return None
-    if not ((2 if loose else 3) <= handle_depth <= min(16 if loose else 12, depth * (0.45 if not loose else 0.55))):
-        return None
-    # Handle should form in the upper half of the cup.
-    if handle_low < cup_low + (left_high - cup_low) * (0.50 if loose else 0.60):
-        return None
-    if not (pivot * (0.93 if loose else 0.965) <= m["last"] <= pivot * (1.015 if loose else 1.006)):
-        return None
-    if not (m["last"] > m["sma200"] and m["last"] >= 0.75 * m["high252"]):
+    max_handle_depth = min(15.0 if loose else (11.0 if not strict else 8.0), depth * (0.38 if loose else 0.30))
+    if not ((2.0 if loose else 3.0) <= handle_depth <= max_handle_depth):
         return None
 
+    # Handle should be in upper half / preferably upper third of cup.
+    upper_half_floor = cup_low + (rim - cup_low) * (0.55 if loose else 0.62)
+    if handle_low < upper_half_floor:
+        return None
+
+    # Handle should drift sideways/down, not continue straight up.
     handle_slope = _slope_pct_per_bar(handle["Close"])
-    if handle_slope > (0.25 if loose else 0.12):
+    if handle_slope > (0.18 if loose else (0.08 if not strict else 0.02)):
         return None
-    vol_quiet = float(handle["Volume"].tail(10).mean()) < float(w["Volume"].tail(80).mean()) * (0.90 if loose else 0.78)
+
+    # Last price should be under/near the pivot, not far away and not already extended.
+    last = float(m["last"])
+    dist_to_pivot = (pivot - last) / max(pivot, 1e-9) * 100
+    if dist_to_pivot < -1.0 or dist_to_pivot > (8.0 if loose else (5.0 if not strict else 3.0)):
+        return None
+
+    # Trend and quality filters.
+    if not (last > m["sma200"] and last >= 0.75 * m["high252"]):
+        return None
+    if strict and not (last > m["sma50"] and m["sma50"] > m["sma150"]):
+        return None
+
+    vol_quiet = float(handle["Volume"].tail(min(10, len(handle))).mean()) < float(w["Volume"].tail(90).mean()) * (0.88 if loose else (0.76 if not strict else 0.68))
     if strict and not vol_quiet:
         return None
 
-    score = 60
-    reasons = [f"U-shaped cup depth {depth:.0f}%", f"handle depth {handle_depth:.0f}%", "near handle pivot"]
-    if right_near_left <= 8: score += 10; reasons.append("right side near old high")
-    if vol_quiet: score += 10; reasons.append("handle volume quiet")
-    if m.get("rs_vs_spy", 0) > 0: score += 10; reasons.append("relative strength positive")
-    if m["last"] > m["ema21"]: score += 5; reasons.append("above 21 EMA")
-    if m["last"] >= pivot * 0.985: score += 5; reasons.append("close to breakout")
-    target = pivot + (left_high - cup_low)
-    return hit(ticker, "Cup & Handle", score, "Bullish", reasons, pivot, handle_low, target)
+    score = 58
+    reasons = [
+        f"cup depth {depth:.0f}%",
+        f"rim mismatch {rim_mismatch:.1f}%",
+        f"handle depth {handle_depth:.0f}%",
+        "handle in upper half of cup",
+        "near handle pivot",
+    ]
+    if near_bottom_bars >= 8:
+        score += 8; reasons.append("rounded bottom")
+    if rim_mismatch <= 6:
+        score += 8; reasons.append("right rim near left rim")
+    if vol_quiet:
+        score += 10; reasons.append("handle volume quiet")
+    if m.get("rs_vs_spy", 0) > 0:
+        score += 8; reasons.append("relative strength positive")
+    if last > m["ema21"]:
+        score += 5; reasons.append("above 21 EMA")
+    if dist_to_pivot <= 2.0:
+        score += 5; reasons.append("close to breakout")
 
+    target = pivot + (rim - cup_low)
+    return hit(ticker, "Cup & Handle", score, "Bullish", reasons, pivot, handle_low, target)
 
 def ascending_triangle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
     """Ascending triangle: flat resistance with rising/holding lows and price near breakout."""
@@ -2559,7 +2649,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V9.0")
+    st.caption("Chart Pattern Scanner — V9.1")
 
     with st.sidebar:
         st.header("Scanner Settings")
