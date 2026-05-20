@@ -1,5 +1,5 @@
 """
-Market Pattern Scanner — Chart Scanner
+Chart Scanner
 Original implementation for educational / research use.
 
 Run:
