@@ -26,7 +26,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "Chart Pattern Scanner V9.5"
+APP_NAME = "Chart Pattern Scanner V9.6"
 
 DUPLICATE_SHARE_CLASS_REMOVE = {"GOOG", "FOXA", "NWS"}  # keep GOOGL, FOX, NWSA by default
 YF_CHUNK_SIZE = 75
@@ -1443,203 +1443,253 @@ def vcp(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanH
     return hit(ticker, "Volatility Contraction Pattern", score, "Bullish", reasons, pivot, stop, target)
 
 def _cup_handle_candidate(ticker: str, w: pd.DataFrame, intraday_style: bool, loose: bool, strict: bool, m: dict) -> Optional[dict]:
-    """Evaluate one recent window as a current cup-and-handle candidate.
+    """Strict current Cup & Handle detector.
 
-    This function assumes the handle is the most recent consolidation. It scans several
-    possible handle lengths so intraday examples such as ENPH 1h are not missed just
-    because the handle is short. It also rejects daily false positives that are really
-    one-bar gap moves or flat boxes rather than rounded cups.
+    A real cup-and-handle requires a left rim, a rounded decline to a cup low,
+    a right-side recovery back near the rim, then a small handle at the far
+    right edge. Earlier versions were too permissive and treated ordinary
+    high bases or one-bar breakouts as cups. This version is intentionally
+    selective, especially for intraday scans.
     """
     w = w.copy().reset_index(drop=True)
     n = len(w)
-    if n < (45 if intraday_style else 90):
+    if n < (50 if intraday_style else 100):
         return None
 
     if intraday_style:
-        handle_min = 3 if loose else (4 if not strict else 6)
-        handle_max = min(24 if loose else (20 if not strict else 16), max(4, n // 4))
-        min_left_space = 8 if loose else 10
-        min_right_space = 8 if loose else 10
-        min_cup_bars = 24 if loose else 30
-        min_depth = 2.8 if loose else (3.5 if not strict else 5.0)
-        max_depth = 24.0 if loose else (18.0 if not strict else 14.0)
-        max_rim_mismatch = 18.0 if loose else (14.0 if not strict else 10.0)
-        max_dist_to_pivot = 8.0 if loose else (6.0 if not strict else 3.5)
+        handle_min = 4 if loose else (5 if not strict else 7)
+        handle_max = min(18 if loose else (16 if not strict else 13), max(5, n // 5))
+        min_cup_bars = 30 if loose else (38 if not strict else 48)
+        max_cup_bars = 145 if loose else (120 if not strict else 95)
+        min_depth = 3.5 if loose else (4.8 if not strict else 6.0)
+        max_depth = 19.0 if loose else (15.5 if not strict else 12.5)
+        rim_tol = 10.0 if loose else (7.5 if not strict else 5.5)
+        max_handle_depth_pct = 6.5 if loose else (5.2 if not strict else 4.0)
+        max_dist_to_pivot = 4.5 if loose else (3.0 if not strict else 1.8)
         min_bottom_bars = 2 if loose else (3 if not strict else 4)
-        upper_half_frac = 0.46 if loose else (0.50 if not strict else 0.56)
-        max_handle_depth_abs = 8.5 if loose else (6.5 if not strict else 4.5)
+        min_side_bars = 8 if loose else (10 if not strict else 13)
+        right_rim_recent_max = 28 if loose else (22 if not strict else 18)
     else:
-        handle_min = 7 if loose else (9 if not strict else 12)
-        handle_max = min(35 if loose else (30 if not strict else 24), max(10, n // 4))
-        min_left_space = 20 if loose else 28
-        min_right_space = 24 if loose else 32
-        min_cup_bars = 65 if loose else 80
-        min_depth = 10.0 if loose else (12.0 if not strict else 14.0)
-        max_depth = 42.0 if loose else (34.0 if not strict else 28.0)
-        max_rim_mismatch = 12.0 if loose else (8.0 if not strict else 5.5)
-        max_dist_to_pivot = 7.0 if loose else (5.0 if not strict else 3.0)
-        min_bottom_bars = 5 if loose else (7 if not strict else 9)
-        upper_half_frac = 0.56 if loose else (0.62 if not strict else 0.68)
-        max_handle_depth_abs = 14.0 if loose else (11.0 if not strict else 8.0)
+        handle_min = 8 if loose else (10 if not strict else 13)
+        handle_max = min(30 if loose else (26 if not strict else 22), max(9, n // 5))
+        min_cup_bars = 70 if loose else (90 if not strict else 115)
+        max_cup_bars = 230 if loose else (205 if not strict else 180)
+        min_depth = 12.0 if loose else (14.0 if not strict else 16.0)
+        max_depth = 38.0 if loose else (32.0 if not strict else 27.0)
+        rim_tol = 8.0 if loose else (5.5 if not strict else 4.0)
+        max_handle_depth_pct = 11.0 if loose else (8.5 if not strict else 6.5)
+        max_dist_to_pivot = 4.5 if loose else (3.0 if not strict else 2.0)
+        min_bottom_bars = 6 if loose else (8 if not strict else 10)
+        min_side_bars = 18 if loose else (24 if not strict else 30)
+        right_rim_recent_max = 40 if loose else (34 if not strict else 28)
+
+    highs, lows = _recent_swing_points(w, 2, 2)
+    if len(highs) < 2 or len(lows) < 1:
+        return None
 
     best = None
-    # Try different recent handle lengths. The handle should be at the far right edge.
+    last = float(m.get("last", w["Close"].iloc[-1]))
+    if last <= 0:
+        return None
+
+    # The handle must be the most recent pause. Try several handle lengths.
     for hlen in range(handle_min, handle_max + 1):
-        cup = w.iloc[:-hlen].copy()
-        handle = w.iloc[-hlen:].copy()
-        if len(cup) < min_cup_bars:
+        cup_end = n - hlen
+        if cup_end <= 0:
+            continue
+        handle = w.iloc[cup_end:].copy()
+        cup_zone = w.iloc[:cup_end].copy()
+        if len(cup_zone) < min_cup_bars:
             continue
 
-        low_i = _position_of_min(cup["Low"])
-        if low_i < min_left_space or low_i > len(cup) - min_right_space:
-            continue
-
-        left = cup.iloc[:low_i]
-        right = cup.iloc[low_i:]
-        if len(left) < min_left_space or len(right) < min_right_space:
-            continue
-
-        left_rim_i = _position_of_max(left["High"])
-        right_rim_rel = _position_of_max(right["High"])
-        right_rim_i = low_i + right_rim_rel
-
-        if low_i - left_rim_i < (6 if intraday_style else 14):
-            continue
-        if right_rim_i - low_i < (6 if intraday_style else 18):
-            continue
-
-        left_rim = float(cup["High"].iloc[left_rim_i])
-        right_rim = float(cup["High"].iloc[right_rim_i])
-        cup_low = float(cup["Low"].iloc[low_i])
-        rim = min(left_rim, right_rim)
-        if rim <= 0 or cup_low <= 0:
-            continue
-
-        depth = (rim - cup_low) / rim * 100.0
-        if not (min_depth <= depth <= max_depth):
-            continue
-
-        rim_mismatch = abs(left_rim - right_rim) / max(left_rim, 1e-9) * 100.0
-        if rim_mismatch > max_rim_mismatch:
-            continue
-
-        recovery = (right_rim - cup_low) / max(rim - cup_low, 1e-9)
-        if recovery < (0.68 if intraday_style and loose else (0.74 if intraday_style else (0.84 if loose else (0.88 if not strict else 0.93)))):
-            continue
-
-        # Bottom should spend time near the low. This prevents a sharp V from being called a cup.
-        lower_third = cup_low + (rim - cup_low) * (0.36 if intraday_style else 0.33)
-        bw = 8 if intraday_style else 18
-        bottom_window = cup.iloc[max(0, low_i - bw): min(len(cup), low_i + bw + 1)]
-        near_bottom_bars = int((bottom_window["Low"] <= lower_third).sum())
-        if near_bottom_bars < min_bottom_bars:
-            continue
-
-        cup_bars = right_rim_i - left_rim_i
-        if cup_bars < min_cup_bars:
-            continue
-
-        # Daily chart protection: reject DOC-style one-gap launches that are not rounded cups.
-        if not intraday_style:
-            right_side = cup.iloc[low_i:right_rim_i + 1].copy()
-            if len(right_side) < min_right_space:
+        # Right rim must be a swing high near the start of the handle, not an old high.
+        right_candidates = [(i, h) for i, h in highs if i < cup_end and cup_end - i <= right_rim_recent_max]
+        if not right_candidates:
+            # fallback: allow the highest high just before the handle if no formal swing printed yet
+            search_start = max(0, cup_end - right_rim_recent_max)
+            local = w.iloc[search_start:cup_end]
+            if local.empty:
                 continue
-            close_pct = right_side["Close"].pct_change().abs().replace([np.inf, -np.inf], np.nan).dropna() * 100.0
-            max_one_bar_jump = float(close_pct.max()) if not close_pct.empty else 0.0
-            # A daily cup should recover over several bars, not by one vertical gap that represents most of the cup depth.
-            if max_one_bar_jump > max(8.0, depth * (0.42 if strict else 0.55)):
+            rr_rel = _position_of_max(local["High"])
+            if rr_rel < 0:
                 continue
-            # Require multiple closes on the right side above the midpoint, not just one spike.
-            midpoint = cup_low + (rim - cup_low) * 0.50
-            if int((right_side["Close"] > midpoint).sum()) < (10 if loose else 14):
+            right_candidates = [(search_start + rr_rel, float(local["High"].iloc[rr_rel]))]
+
+        for right_i, right_rim in right_candidates:
+            # Left rim must be before the right rim and separated enough to form a visible U.
+            left_candidates = [(i, h) for i, h in highs if i < right_i - min_cup_bars]
+            if not left_candidates:
                 continue
+            # Prefer a high that is near the right rim; don't pick a random ancient high.
+            left_candidates = sorted(left_candidates, key=lambda x: (abs(x[1] - right_rim) / max(right_rim, 1e-9), -x[1]))[:6]
+            for left_i, left_rim in left_candidates:
+                cup_bars = right_i - left_i
+                if cup_bars < min_cup_bars or cup_bars > max_cup_bars:
+                    continue
+                middle = w.iloc[left_i:right_i + 1].copy()
+                if len(middle) < min_cup_bars:
+                    continue
 
-        handle_high = float(handle["High"].max())
-        handle_low = float(handle["Low"].min())
-        pivot = float(handle["High"].iloc[:-1].max()) if len(handle) > 2 else handle_high
-        pivot = max(pivot, right_rim * (0.985 if intraday_style else 0.995))
-        if pivot <= 0:
-            continue
+                low_rel = _position_of_min(middle["Low"])
+                if low_rel < 0:
+                    continue
+                low_i = left_i + low_rel
+                cup_low = float(w["Low"].iloc[low_i])
 
-        handle_depth = (handle_high - handle_low) / max(handle_high, 1e-9) * 100.0
-        max_handle_depth = min(max_handle_depth_abs, depth * (0.55 if intraday_style else (0.40 if loose else 0.32)))
-        if handle_depth < (0.35 if intraday_style and loose else (0.60 if intraday_style else 1.5)):
-            continue
-        if handle_depth > max_handle_depth:
-            continue
+                if low_i - left_i < min_side_bars or right_i - low_i < min_side_bars:
+                    continue
 
-        upper_half_floor = cup_low + (rim - cup_low) * upper_half_frac
-        if handle_low < upper_half_floor:
-            continue
+                rim = min(float(left_rim), float(right_rim))
+                if rim <= 0 or cup_low <= 0 or cup_low >= rim:
+                    continue
+                depth = (rim - cup_low) / rim * 100.0
+                if depth < min_depth or depth > max_depth:
+                    continue
 
-        # A handle should be tight/sideways/down. It should not be the right side continuing straight up.
-        handle_slope = _slope_pct_per_bar(handle["Close"])
-        if handle_slope > (0.55 if intraday_style and loose else (0.35 if intraday_style else (0.08 if loose else 0.03))):
-            continue
+                rim_mismatch = abs(float(left_rim) - float(right_rim)) / max(rim, 1e-9) * 100.0
+                # Right rim may be slightly lower than left rim, but not dramatically lower/higher.
+                if rim_mismatch > rim_tol:
+                    continue
+                if float(right_rim) < float(left_rim) * (1 - rim_tol / 100.0):
+                    continue
+                if float(right_rim) > float(left_rim) * (1 + (rim_tol * 0.75) / 100.0):
+                    continue
 
-        last = float(m["last"])
-        dist_to_pivot = (pivot - last) / max(pivot, 1e-9) * 100.0
-        if dist_to_pivot < -2.5 or dist_to_pivot > max_dist_to_pivot:
-            continue
+                # The low should occur in the middle portion of the cup, not right next to either rim.
+                low_pos = (low_i - left_i) / max(cup_bars, 1)
+                if not (0.25 <= low_pos <= 0.75):
+                    continue
 
-        # Trend/quality context.
-        if intraday_style:
-            if not (last > m["ema21"] or last > m["sma50"]):
-                continue
-        else:
-            if not (last > m["sma200"] and last >= 0.70 * m["high252"]):
-                continue
-            if strict and not (last > m["sma50"] and m["sma50"] >= m["sma150"] * 0.97):
-                continue
+                # Rounded-bottom requirement: multiple bars near the lower third around the cup low.
+                lower_zone = cup_low + (rim - cup_low) * (0.34 if intraday_style else 0.30)
+                bw = 7 if intraday_style else 18
+                bottom_window = w.iloc[max(left_i, low_i - bw): min(right_i + 1, low_i + bw + 1)]
+                near_bottom_bars = int((bottom_window["Low"] <= lower_zone).sum())
+                if near_bottom_bars < min_bottom_bars:
+                    continue
 
-        vol_quiet = float(handle["Volume"].tail(min(6, len(handle))).mean()) < float(w["Volume"].tail(min(60, len(w))).mean()) * (1.05 if intraday_style and loose else (0.92 if intraday_style else (0.84 if loose else 0.76)))
+                # Left side should generally fall into the low and right side should recover from it.
+                left_leg = w.iloc[left_i:low_i + 1]
+                right_leg = w.iloc[low_i:right_i + 1]
+                if len(left_leg) < min_side_bars or len(right_leg) < min_side_bars:
+                    continue
+                left_slope = _slope_pct_per_bar(left_leg["Close"])
+                right_slope = _slope_pct_per_bar(right_leg["Close"])
+                if left_slope >= (-0.015 if intraday_style else -0.006):
+                    continue
+                if right_slope <= (0.015 if intraday_style else 0.006):
+                    continue
 
-        score = 55
-        if intraday_style:
-            score += 5
-        if near_bottom_bars >= min_bottom_bars + 1:
-            score += 8
-        if rim_mismatch <= (10 if intraday_style else 6):
-            score += 8
-        if vol_quiet:
-            score += 8
-        if m.get("rs_vs_spy", 0) > 0:
-            score += 6
-        if dist_to_pivot <= 2.0:
-            score += 6
-        if handle_depth <= max_handle_depth * 0.70:
-            score += 4
-        if not intraday_style and cup_bars >= 90:
-            score += 5
+                # Reject flat boxes: cup low must be materially below both rims and price should travel around the U.
+                closes = middle["Close"].astype(float)
+                if (float(closes.max()) - float(closes.min())) / max(rim, 1e-9) * 100.0 < min_depth * 0.85:
+                    continue
 
-        candidate = {
-            "score": score,
-            "depth": depth,
-            "rim_mismatch": rim_mismatch,
-            "handle_depth": handle_depth,
-            "near_bottom_bars": near_bottom_bars,
-            "pivot": pivot,
-            "stop": handle_low,
-            "target": pivot + (rim - cup_low),
-            "vol_quiet": vol_quiet,
-            "dist_to_pivot": dist_to_pivot,
-            "cup_bars": cup_bars,
-        }
-        if best is None or candidate["score"] > best["score"]:
-            best = candidate
+                # Daily protection against one vertical gap/breakout from a flat base.
+                if not intraday_style:
+                    right_side = w.iloc[low_i:right_i + 1].copy()
+                    pct_changes = right_side["Close"].pct_change().abs().replace([np.inf, -np.inf], np.nan).dropna() * 100.0
+                    if not pct_changes.empty and float(pct_changes.max()) > max(7.5, depth * 0.45):
+                        continue
+                    midpoint = cup_low + (rim - cup_low) * 0.50
+                    if int((right_side["Close"] > midpoint).sum()) < (10 if loose else 14):
+                        continue
+
+                handle_high = float(handle["High"].max())
+                handle_low = float(handle["Low"].min())
+                if handle_high <= 0 or handle_low <= 0:
+                    continue
+                pivot = max(float(right_rim), float(handle["High"].iloc[:-1].max()) if len(handle) > 2 else handle_high)
+
+                handle_depth = (handle_high - handle_low) / max(handle_high, 1e-9) * 100.0
+                handle_depth_vs_cup = (handle_high - handle_low) / max(rim - cup_low, 1e-9) * 100.0
+                if handle_depth < (0.45 if intraday_style else 1.0):
+                    continue
+                if handle_depth > max_handle_depth_pct:
+                    continue
+                if handle_depth_vs_cup > (42 if loose else 34 if not strict else 28):
+                    continue
+
+                # Handle must form in the upper half/third of the cup.
+                upper_floor = cup_low + (rim - cup_low) * (0.50 if intraday_style and loose else 0.56 if intraday_style else 0.62)
+                if handle_low < upper_floor:
+                    continue
+
+                # Handle should be sideways/slight downward. If it is a strong upward leg, it is not a handle.
+                handle_slope = _slope_pct_per_bar(handle["Close"])
+                if handle_slope > (0.28 if intraday_style and loose else 0.18 if intraday_style else 0.04):
+                    continue
+
+                dist_to_pivot = (pivot - last) / max(pivot, 1e-9) * 100.0
+                # Allow small triggered breakouts, but reject names already extended far above pivot.
+                if dist_to_pivot < -(1.6 if intraday_style else 2.0):
+                    continue
+                if dist_to_pivot > max_dist_to_pivot:
+                    continue
+
+                # Quality context.
+                if intraday_style:
+                    if not (last >= m.get("ema21", last) * 0.985 or last >= m.get("sma50", last) * 0.985):
+                        continue
+                else:
+                    if not (last > m["sma200"] and last >= 0.72 * m["high252"]):
+                        continue
+                    if strict and not (last > m["sma50"] and m["sma50"] >= m["sma150"] * 0.97):
+                        continue
+
+                recent_vol = float(handle["Volume"].tail(min(5, len(handle))).mean())
+                base_vol = float(w.iloc[max(0, left_i):right_i + 1]["Volume"].mean())
+                vol_quiet = recent_vol < base_vol * (0.90 if intraday_style and loose else 0.78 if intraday_style else 0.76)
+
+                score = 58
+                if intraday_style:
+                    score += 4
+                if rim_mismatch <= (5.0 if intraday_style else 4.0):
+                    score += 8
+                if near_bottom_bars >= min_bottom_bars + 1:
+                    score += 8
+                if vol_quiet:
+                    score += 8
+                if dist_to_pivot <= 1.5:
+                    score += 8
+                if handle_depth_vs_cup <= 28:
+                    score += 5
+                if m.get("rs_vs_spy", 0) > 0:
+                    score += 5
+                if not intraday_style and cup_bars >= 100:
+                    score += 5
+
+                candidate = {
+                    "score": score,
+                    "depth": depth,
+                    "rim_mismatch": rim_mismatch,
+                    "handle_depth": handle_depth,
+                    "handle_depth_vs_cup": handle_depth_vs_cup,
+                    "near_bottom_bars": near_bottom_bars,
+                    "pivot": pivot,
+                    "stop": handle_low,
+                    "target": pivot + (rim - cup_low),
+                    "vol_quiet": vol_quiet,
+                    "dist_to_pivot": dist_to_pivot,
+                    "cup_bars": cup_bars,
+                    "left_i": left_i,
+                    "low_i": low_i,
+                    "right_i": right_i,
+                }
+                if best is None or candidate["score"] > best["score"]:
+                    best = candidate
     return best
 
 
 def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optional[ScanHit]:
-    """Cup & Handle scanner with separate daily and intraday logic.
+    """Cup & Handle scanner.
 
-    Key V9.5 fix: intraday mode is now based on the selected interval, not the number
-    of bars downloaded. Before this, 1h charts with many bars could accidentally use
-    daily-style cup rules and miss intraday cups like ENPH. Daily scans are also
-    protected from DOC-style false positives where a flat base plus one vertical gap
-    was being mislabeled as a cup.
+    V9.6 fix: much stricter Cup & Handle structure. The scan now requires a
+    visible left rim, rounded cup low, right rim, and a real handle at the far
+    right edge. This should reduce broad false positives and is designed to
+    catch ENPH-style 1h cups when the selected interval is intraday.
     """
-    if len(df) < 60:
+    if len(df) < 55:
         return None
 
     m = base_metrics(df, spy_df)
@@ -1650,17 +1700,15 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
 
     available = len(df)
     if intraday_style:
-        # Search multiple recent windows because an intraday cup may form over a few sessions
-        # or over a few weeks of hourly bars. The handle must still be at the right edge.
-        candidate_windows = [55, 75, 100, 130, 170, 220]
-        windows = [min(x, available) for x in candidate_windows if available >= max(45, int(x * 0.75))]
+        candidate_windows = [70, 95, 125, 160, 210]
+        windows = [min(x, available) for x in candidate_windows if available >= max(55, int(x * 0.75))]
         if not windows:
-            windows = [min(available, 70)]
+            windows = [min(available, 90)]
     else:
-        candidate_windows = [110, 150, 190, 240]
-        windows = [min(x, available) for x in candidate_windows if available >= max(90, int(x * 0.85))]
+        candidate_windows = [130, 170, 220, 260]
+        windows = [min(x, available) for x in candidate_windows if available >= max(105, int(x * 0.82))]
         if not windows:
-            windows = [min(available, 150)]
+            windows = [min(available, 160)]
 
     best = None
     for w_len in sorted(set(windows)):
@@ -1673,14 +1721,15 @@ def cup_handle(ticker: str, df: pd.DataFrame, meta=None, spy_df=None) -> Optiona
         return None
 
     reasons = [
-        f"{'intraday ' if intraday_style else ''}cup depth {best['depth']:.0f}%",
+        f"{'intraday ' if intraday_style else ''}cup depth {best['depth']:.1f}%",
         f"cup duration {int(best['cup_bars'])} bars",
         f"rim mismatch {best['rim_mismatch']:.1f}%",
         f"handle depth {best['handle_depth']:.1f}%",
+        f"handle is {best['handle_depth_vs_cup']:.0f}% of cup depth",
         "handle in upper half of cup",
         "near handle pivot",
     ]
-    if best.get("near_bottom_bars", 0) >= (4 if intraday_style else 7):
+    if best.get("near_bottom_bars", 0) >= (3 if intraday_style else 8):
         reasons.append("rounded bottom")
     if best.get("vol_quiet"):
         reasons.append("handle volume quiet")
@@ -3162,7 +3211,7 @@ def plot_chart(ticker: str, period="1y", interval="1d"):
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
     st.title("📈 Chart Pattern Scanner")
-    st.caption("Chart Pattern Scanner — V9.5")
+    st.caption("Chart Pattern Scanner — V9.6")
 
     with st.sidebar:
         st.header("Scanner Settings")
